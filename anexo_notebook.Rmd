@@ -1,0 +1,294 @@
+---
+title: "Anexo: notebook del análisis de la red bancaria global, 1978--2025"
+subtitle: "Trabajo Final -- Ciencia de Datos (Maestría en Economía, UBA)"
+author: "Thomás Cordeiro"
+date: "Octubre de 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+# Carpetas: el notebook se ejecuta desde la carpeta del trabajo, que contiene
+# la carpeta codigo/ con los datos y los resultados de los scripts.
+dir_proc <- file.path("codigo", "datos", "procesados")
+dir_tab  <- file.path("codigo", "resultados", "tablas")
+dir_fig  <- file.path("codigo", "resultados", "figuras")
+leer <- function(...) read.csv(file.path(...), na.strings = "")  # "NA" = Namibia
+etiquetas <- c(grado_ent = "Grado de entrada", grado_sal = "Grado de salida",
+               fuerza_ent = "Fuerza de entrada", fuerza_sal = "Fuerza de salida",
+               log_fuerza_ent = "Fuerza de entrada (log)", log_fuerza_sal = "Fuerza de salida (log)",
+               hhi_ent = "HHI de entrada", hhi_sal = "HHI de salida",
+               cl_ent = "Clustering de entrada", cl_cic = "Clustering cycle",
+               cl_cic_red_completa = "Clustering cycle (grados de la red completa)",
+               completa = "Completa", nucleo_periferia = "Núcleo-periferia",
+               nucleo_nucleo = "Núcleo-núcleo",
+               antes_3_4 = "3-4 años antes", antes_1_2 = "1-2 años antes", inicio = "Inicio",
+               despues_1_2 = "1-2 años después", despues_3_4 = "3-4 años después")
+tabla <- function(x, ...) {
+  x <- as.data.frame(x)
+  for (v in names(x)) if (is.character(x[[v]])) {
+    x[[v]] <- ifelse(x[[v]] %in% names(etiquetas), etiquetas[x[[v]]], x[[v]])
+    x[[v]] <- gsub("(\\d)\\.(\\d)", "\\1,\\2", x[[v]])
+  }
+  knitr::kable(x, format.args = list(decimal.mark = ","), ...)
+}
+```
+
+# Objetivo y organización
+
+Este notebook acompaña el trabajo escrito. Describe el pipeline de datos, la construcción de la red, las métricas calculadas y la estimación, y muestra los resultados con su interpretación económica. El cálculo completo está en dos scripts de R, en la carpeta `codigo/`, que se ejecutan en este orden:
+
+| Script | Qué hace | Salidas |
+|---|---|---|
+| `01_importacion_limpieza.R` | Descarga las estadísticas bancarias locacionales (LBS) del BIS y el índice de precios de EE.UU. (FRED); limpia la base | `datos/brutos/`, `datos/procesados/` |
+| `02_redes_resultados.R` | Construye las redes anuales, calcula los indicadores, estima las regresiones alrededor de las crisis y el ejercicio de robustez | `resultados/tablas/`, `resultados/figuras/` |
+
+El notebook no repite todo el cálculo: lee las salidas de los scripts y, en cada etapa, rehace un paso con el código a la vista para verificar que coincide con lo guardado. Las salidas de los scripts se incluyen en el repositorio, por lo que el notebook puede ejecutarse directamente; para regenerarlas, se corren `01` y `02`.
+
+# Datos
+
+## Fuente
+
+Los datos son los flujos trimestrales de activos transfronterizos (*claims*) de las LBS del BIS, ajustados por tipo de cambio y quiebres de serie, entre 1978 y 2025. Las LBS se clasifican por residencia: una oficina bancaria se asigna al país donde está ubicada, cualquiera sea la nacionalidad del banco. En la versión pública, parte de las observaciones bilaterales aparecen suprimidas por confidencialidad; se excluyen, de modo que un vínculo suprimido se trata como inexistente.
+
+```{r datos}
+lbs       <- readRDS(file.path(dir_proc, "lbs_trimestral_limpio.rds"))
+ipc       <- readRDS(file.path(dir_proc, "ipc_eeuu_anual.rds"))
+cobertura <- leer(dir_proc, "cobertura_declarantes.csv")
+
+c(observaciones = nrow(lbs),
+  declarantes   = length(unique(lbs$declarante)),
+  contrapartes  = length(unique(lbs$contraparte)))
+```
+
+## Núcleo y periferia
+
+Solo los países declarantes informan sus préstamos. Como en el paper, el *núcleo* son los declarantes con datos bilaterales continuos desde 1978; en los datos públicos son 12. El resto de los países forma la *periferia*.
+
+```{r cobertura}
+nucleo <- cobertura$declarante[cobertura$continuo_1978]
+tabla(cobertura[cobertura$continuo_1978,
+                c("declarante", "primer_periodo", "n_contrapartes", "pct_suprimidas")],
+      col.names = c("Declarante", "Desde", "Contrapartes", "% suprimido"),
+      row.names = FALSE)
+```
+
+La supresión es baja en los grandes centros y alta en Países Bajos; por eso el script `02` repite el análisis sin ese país (sección 7).
+
+# Construcción de la red
+
+## De flujos trimestrales a la red anual
+
+Para cada par de países y año, el flujo anual es la suma de los flujos trimestrales, deflactada por el IPC urbano de EE.UU. (2009 = 1) y expresada en miles de millones de dólares. Los flujos anuales negativos (repagos netos) se fijan en cero:
+
+$$w_{ij,t} = \max\!\left(\frac{F_{ij,t}}{P_t},\, 0\right), \qquad a_{ij,t} = \mathbf{1}[w_{ij,t} > 0].$$
+
+Un enlace $i \to j$ indica que los bancos ubicados en $i$ aumentaron su crédito a $j$ en el año. A modo de ejemplo, se arma la red de 2007:
+
+```{r red2007}
+anio <- 2007
+x <- lbs[lbs$declarante %in% nucleo & lbs$anio == anio, ]
+anual <- aggregate(flujo_musd ~ declarante + contraparte, data = x, FUN = sum)
+anual$peso <- pmax(anual$flujo_musd / ipc$deflactor[ipc$anio == anio] / 1000, 0)
+
+nodos <- sort(union(nucleo, anual$contraparte))      # núcleo + contrapartes
+enl   <- anual[anual$peso > 0 & anual$declarante != anual$contraparte, ]
+
+W <- matrix(0, length(nodos), length(nodos), dimnames = list(nodos, nodos))
+W[cbind(enl$declarante, enl$contraparte)] <- enl$peso   # filas: prestamistas
+A <- (W > 0) * 1                                         # matriz de adyacencia
+
+c(nodos = length(nodos), enlaces = sum(A),
+  flujo_total_mm_usd2009 = round(sum(W)))
+```
+
+Los nodos de cada año son los países del núcleo más todas las contrapartes que reciben crédito del núcleo ese año. El conjunto cambia en el tiempo porque algunos países aparecen o desaparecen como contraparte (por ejemplo, la Unión Soviética hasta 1993 y sus Estados sucesores desde 1994).
+
+## Las tres redes
+
+Como en el paper, se analizan tres redes: la *red completa* (enlaces del núcleo hacia todos los países), la *núcleo--periferia* y la *núcleo--núcleo*, la única en la que los vínculos pueden ser recíprocos. La submatriz núcleo--núcleo de 2007:
+
+```{r nucleo2007}
+A[nucleo, nucleo]
+```
+
+# Métricas
+
+## Grado, fuerza y concentración
+
+Para cada nodo $i$: grado de entrada y de salida, $k_i^{in} = \sum_j a_{ji}$ y $k_i^{out} = \sum_j a_{ij}$ (sumas por columna y por fila de $A$); fuerza, $s_i^{in} = \sum_j w_{ji}$ y $s_i^{out} = \sum_j w_{ij}$ (las mismas sumas sobre $W$); y el índice de Herfindahl--Hirschman de los socios, $\text{HHI}_i^{in} = \sum_j (w_{ji}/s_i^{in})^2$.
+
+```{r metricas}
+k_in  <- colSums(A); k_out <- rowSums(A)
+s_in  <- colSums(W); s_out <- rowSums(W)
+hhi_in <- ifelse(s_in > 0, colSums((t(t(W) / ifelse(s_in > 0, s_in, 1)))^2), 0)
+```
+
+## Clustering
+
+El clustering mide qué proporción de los triángulos posibles alrededor de un nodo se forma efectivamente. Se usan los dos patrones del paper, tomados de Fagiolo (2007): "in" (dos prestamistas de $i$ que también se prestan entre sí) y "cycle" ($i \to j \to h \to i$). El elemento diagonal de un producto de matrices de adyacencia cuenta los caminos cerrados que empiezan y terminan en $i$:
+
+$$C_i^{in} = \frac{(A^\top A^2)_{ii}}{k_i^{in}(k_i^{in}-1)}, \qquad
+C_i^{cycle} = \frac{(A^3)_{ii}}{k_i^{in}k_i^{out} - k_i^{\leftrightarrow}}, \qquad k_i^{\leftrightarrow} = (A^2)_{ii}.$$
+
+Cuando el denominador es cero, el coeficiente se fija en cero.
+
+```{r clustering}
+A2 <- A %*% A
+cl_in <- ifelse(k_in > 1, diag(t(A) %*% A2) / (k_in * (k_in - 1)), 0)
+```
+
+## Verificación contra los resultados del script
+
+Las medias de 2007 calculadas aquí coinciden con las que guarda `02_redes_resultados.R`:
+
+```{r verificacion}
+ind <- leer(dir_proc, "indicadores_nodo_anual.csv")
+guardado <- ind[ind$red == "completa" & ind$anio == anio, ]
+tabla(data.frame(
+  indicador  = c("Grado de entrada", "Fuerza de entrada", "HHI de entrada",
+                 "Clustering de entrada", "Grado de salida (núcleo)"),
+  notebook   = c(mean(k_in), mean(s_in), mean(hhi_in), mean(cl_in),
+                 mean(k_out[nucleo])),
+  script     = c(mean(guardado$grado_ent), mean(guardado$fuerza_ent),
+                 mean(guardado$hhi_ent), mean(guardado$cl_ent),
+                 mean(guardado$grado_sal[guardado$es_nucleo]))),
+  digits = 3, row.names = FALSE)
+```
+
+## Conectividad
+
+La conectividad es la proporción de enlaces observados sobre los posibles. Como solo presta el núcleo ($N_c = 12$ países), en la red completa hay $N_c(N_t - 1)$ enlaces posibles, donde $N_t$ es el número de nodos del año:
+
+```{r conectividad}
+red <- leer(dir_tab, "rep_indicadores_red_anuales_1978_2025.csv")
+c(notebook = sum(A) / (length(nucleo) * (length(nodos) - 1)),
+  script   = red$conectividad[red$red == "completa" & red$anio == anio])
+```
+
+# Resultados descriptivos
+
+## Comparación con la Tabla 1 del paper
+
+```{r tabla1}
+t1 <- leer(dir_tab, "rep_tabla1_comparacion_con_paper.csv")
+tabla(t1, digits = 2, row.names = FALSE,
+      col.names = c("Red", "Indicador", "Paper 1980", "Este trabajo 1980",
+                    "Paper 2007", "Este trabajo 2007", "2019", "2025"))
+```
+
+El patrón del paper se reproduce: entre 1980 y 2007 aumentan el grado y, sobre todo, la fuerza, y el núcleo es mucho más denso que la periferia. El clustering de entrada coincide casi exactamente. Las diferencias de nivel provienen sobre todo de los datos públicos (núcleo de 12 países en lugar de 15 y vínculos suprimidos). Frente a 2007, en 2019 y 2025 cada país recibe crédito de menos prestamistas y de forma más concentrada.
+
+## Evolución de la red, 1978--2025
+
+```{r figura1, echo = FALSE, out.width = "100%"}
+knitr::include_graphics(file.path(dir_fig, "rep_fig3_indicadores_red_1978_2025.png"))
+```
+
+La línea vertical marca el fin de la muestra del paper (2010).
+
+```{r periodos}
+nn <- red[red$red == "nucleo_nucleo", ]
+co <- red[red$red == "completa", ]
+tabla(data.frame(
+  periodo = c("1978-2007", "2010-2025"),
+  conectividad_nucleo   = c(mean(nn$conectividad[nn$anio <= 2007]),
+                            mean(nn$conectividad[nn$anio >= 2010])),
+  hhi_salida_nucleo     = c(mean(nn$hhi_sal[nn$anio <= 2007]),
+                            mean(nn$hhi_sal[nn$anio >= 2010])),
+  conectividad_completa = c(mean(co$conectividad[co$anio <= 2007]),
+                            mean(co$conectividad[co$anio >= 2010]))),
+  digits = 2, row.names = FALSE)
+```
+
+**Interpretación.** La red es procíclica: su densidad crece en las fases de expansión de los flujos y cae después de las crisis. El colapso de 2008--2009 fue el mayor de la muestra (la conectividad núcleo--núcleo cayó de 0,83 a 0,27). Después de la crisis, la red entre los grandes prestamistas no recuperó su densidad media anterior a 2008 y su crédito quedó más concentrado, mientras que la red completa se mantuvo cerca de su promedio anterior a 2008: la retracción se concentra en los vínculos entre los propios países del núcleo. La pandemia tuvo un efecto mucho menor que la crisis de 2008.
+
+# Crisis y conexiones
+
+## Especificación
+
+Para cada indicador $y_{it}$ del país $i$ en el año $t$ se estima, como en el paper, una regresión con efectos fijos por país:
+
+$$y_{it} = \alpha_i + \sum_{k=1}^{5}\beta_k D_{k,it} + \varepsilon_{it},$$
+
+donde las cinco variables binarias $D_{k,it}$ marcan si el año está 3--4 o 1--2 años antes del inicio de una crisis bancaria sistémica del país, en el año de inicio, o 1--2 o 3--4 años después; los demás años son la referencia. Las fechas de las crisis provienen de Laeven y Valencia (2026). Los errores estándar se agrupan por país.
+
+## Verificación de un coeficiente
+
+Se reestima aquí el grado de entrada en la muestra de réplica (1978--2010, crisis iniciadas en 1982--2003 o 2007--2008) y se compara con el resultado guardado:
+
+```{r regresion}
+crisis <- leer(dir_tab, "datos_crisis_bancarias_laeven_valencia_2026.csv")
+cr <- crisis[crisis$inicio %in% c(1982:2003, 2007:2008), ]
+d  <- ind[ind$red == "completa" & ind$anio %in% 1978:2010, c("pais", "anio", "grado_ent")]
+
+tramos <- list(antes_3_4 = -4:-3, antes_1_2 = -2:-1, inicio = 0,
+               despues_1_2 = 1:2, despues_3_4 = 3:4)
+for (tr in names(tramos)) d[[tr]] <- 0
+for (j in seq_len(nrow(cr))) {
+  sel <- d$pais == cr$pais[j]
+  for (tr in names(tramos))
+    d[[tr]][sel] <- pmax(d[[tr]][sel], as.numeric((d$anio[sel] - cr$inicio[j]) %in% tramos[[tr]]))
+}
+
+m <- lm(grado_ent ~ antes_3_4 + antes_1_2 + inicio + despues_1_2 + despues_3_4 +
+          factor(pais), data = d)
+
+# Errores agrupados por país (CR1)
+X <- model.matrix(m)[, !is.na(coef(m))]; u <- residuals(m)
+G <- length(unique(d$pais)); N <- nrow(X); K <- ncol(X)
+B <- Reduce(`+`, lapply(split(seq_len(N), d$pais), function(i) {
+  s <- crossprod(X[i, , drop = FALSE], u[i]); s %*% t(s) }))
+V <- solve(crossprod(X)) %*% B %*% solve(crossprod(X)) * G / (G - 1) * (N - 1) / (N - K)
+
+t5 <- leer(dir_tab, "rep_tabla5_estudio_eventos_todas.csv")
+g  <- t5[t5$especificacion == "replica" & t5$panel == "A_completa" &
+           t5$variable == "grado_ent", ]
+tabla(data.frame(tramo = names(tramos),
+                 coef_notebook = coef(m)[names(tramos)],
+                 ee_notebook   = sqrt(diag(V))[names(tramos)],
+                 coef_script   = g$coef, ee_script = g$ee),
+      digits = 3, row.names = FALSE)
+```
+
+## Resultados
+
+```{r figura2, echo = FALSE, out.width = "90%"}
+knitr::include_graphics(file.path(dir_fig, "rep_fig8_crisis_grado_fuerza_entrada.png"))
+```
+
+```{r tabla2}
+cmp <- leer(dir_tab, "rep_tabla5_comparacion_con_paper.csv")
+tabla(cmp[, c("variable", "tramo", "paper", "replica", "extension")],
+      row.names = FALSE,
+      col.names = c("Variable", "Tramo", "Paper", "Réplica 1978-2010",
+                    "Extensión 1978-2025"))
+```
+
+**Interpretación.** Se reproduce el resultado central del paper: en los dos años previos al inicio de una crisis un país tiene en promedio 0,40 prestamistas más que en sus años normales y, en los dos posteriores, 1,45 menos; la fuerza de entrada sigue el mismo patrón. El resultado se mantiene en la muestra extendida y al agregar efectos fijos de año (columnas `_ef_anio` del archivo `rep_tabla5_estudio_eventos_todas.csv`). Del lado de los prestamistas también aumentan las conexiones antes de las crisis, aunque casi todas las crisis del núcleo empiezan en 2007--2008, de modo que ese resultado debe leerse con cautela. Los coeficientes describen correlaciones y no efectos causales.
+
+# Robustez: núcleo sin Países Bajos
+
+```{r robustez}
+rob <- leer(dir_tab, "rob_nucleo_sin_paises_bajos_indicadores_red.csv")
+rob <- rob[rob$red == "nucleo_nucleo" & rob$indicador == "conectividad", ]
+rob$diferencia <- rob$nucleo_sin_NL - rob$nucleo_12
+tabla(rob[which.max(abs(rob$diferencia)), c("anio", "nucleo_12", "nucleo_sin_NL", "diferencia")],
+      digits = 3, row.names = FALSE)
+```
+
+Excluir a Países Bajos, el país del núcleo con más observaciones suprimidas, cambia poco la conectividad núcleo--núcleo: la mayor diferencia en toda la serie es de 0,05.
+
+# Reproducción
+
+1. Ejecutar `codigo/01_importacion_limpieza.R` y `codigo/02_redes_resultados.R` desde la carpeta `codigo/` (en RStudio: *Session > Set Working Directory > To Source File Location*). Los datos se descargan de fuentes abiertas (API del BIS y FRED); la base de crisis de Laeven y Valencia (2026), tomada del sitio del FMI, se incluye en `codigo/datos/brutos/`.
+2. Ejecutar este notebook desde la carpeta del trabajo.
+
+```{r sesion}
+sessionInfo()$R.version$version.string
+```
